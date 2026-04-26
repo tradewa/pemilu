@@ -1,0 +1,20 @@
+renv/library/
+renv/staging/
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Quarto output
+_site/
+*.html
+*.pdf
+analysis_cache/
+analysis_files/
+
+# Data (large files)
+data/
+
+# Agent/tool files
+AGENT.md
+docker-skill.md

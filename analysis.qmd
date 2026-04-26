@@ -1,0 +1,587 @@
+---
+title: "Pilpres 2024 — Bayesian Polling from TPS Data"
+author: "Derrian Gharda"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+---
+
+## 1 Setup
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(scales)
+library(knitr)
+library(jsonlite)
+library(ggdist)
+```
+
+## 2 Load & Clean Data
+
+```{r}
+#| label: load-data
+#| cache: true
+
+kode_provinsi <- c(
+  "11" = "ACEH",
+  "12" = "SUMATERA UTARA",
+  "13" = "SUMATERA BARAT",
+  "14" = "RIAU",
+  "15" = "JAMBI",
+  "16" = "SUMATERA SELATAN",
+  "17" = "BENGKULU",
+  "18" = "LAMPUNG",
+  "19" = "KEPULAUAN BANGKA BELITUNG",
+  "21" = "KEPULAUAN RIAU",
+  "31" = "DKI JAKARTA",
+  "32" = "JAWA BARAT",
+  "33" = "JAWA TENGAH",
+  "34" = "DI YOGYAKARTA",
+  "35" = "JAWA TIMUR",
+  "36" = "BANTEN",
+  "51" = "BALI",
+  "52" = "NUSA TENGGARA BARAT",
+  "53" = "NUSA TENGGARA TIMUR",
+  "61" = "KALIMANTAN BARAT",
+  "62" = "KALIMANTAN TENGAH",
+  "63" = "KALIMANTAN SELATAN",
+  "64" = "KALIMANTAN TIMUR",
+  "65" = "KALIMANTAN UTARA",
+  "71" = "SULAWESI UTARA",
+  "72" = "SULAWESI TENGAH",
+  "73" = "SULAWESI SELATAN",
+  "74" = "SULAWESI TENGGARA",
+  "75" = "GORONTALO",
+  "76" = "SULAWESI BARAT",
+  "81" = "MALUKU",
+  "82" = "MALUKU UTARA",
+  "91" = "PAPUA BARAT DAYA",
+  "92" = "PAPUA",
+  "93" = "PAPUA SELATAN",
+  "94" = "PAPUA TENGAH",
+  "95" = "PAPUA PEGUNUNGAN",
+  "96" = "PAPUA BARAT"
+)
+
+tps_raw <- read_csv("data/tps_raw.csv", col_types = cols(tps = col_character()))
+
+tps <- tps_raw |>
+  mutate(
+    kode_prov = str_sub(tps, 1, 2),
+    provinsi  = kode_provinsi[kode_prov],
+    suara_01  = paslon01,
+    suara_02  = paslon02,
+    suara_03  = paslon03,
+    p_anies   = suara_01 / total_suara,
+    p_prabowo = suara_02 / total_suara,
+    p_ganjar  = suara_03 / total_suara
+  ) |>
+  filter(total_suara > 0, !is.na(provinsi))
+```
+
+## 3 TPS Allocation by Province Size Cluster
+
+Before sampling, the polling agency groups all 38 provinces into four tiers by DPT weight
+and assigns a fixed TPS visit count to every province within each tier. Larger tiers receive
+more visits than smaller ones, but every province inside the same tier gets exactly the same
+count — regardless of how much their voter populations differ within the tier.
+
+This deliberate imperfection means a province's share of the raw sample will not match its
+true DPT share. The gap is most visible inside the largest tier, where the biggest and
+smallest member receive identical TPS counts despite very different voter populations.
+Section 5 visualises this gap; DPT weighting in Section 9 corrects it.
+
+```{r}
+#| label: province-allocation
+
+province_dpt <- tps |>
+  group_by(provinsi) |>
+  summarise(total_voters = sum(total_suara)) |>
+  mutate(proportion = total_voters / sum(total_voters))
+
+cluster_tps <- c("1" = 10L, "2" = 30L, "3" = 60L, "4" = 100L)
+
+province_allocation <- province_dpt |>
+  mutate(
+    cluster     = as.character(ntile(proportion, 4)),
+    n_allocated = cluster_tps[cluster]
+  )
+
+cat("Total TPS allocated:", sum(province_allocation$n_allocated), "\n")
+
+province_allocation |>
+  arrange(desc(n_allocated), desc(proportion)) |>
+  mutate(
+    total_voters = scales::comma(total_voters),
+    proportion   = percent(proportion, accuracy = 0.01),
+    cluster      = paste0("Tier ", cluster, " (", cluster_tps[cluster], " TPS)")
+  ) |>
+  select(provinsi, total_voters, proportion, cluster, n_allocated) |>
+  knitr::kable(col.names = c("Province", "Registered Voters", "DPT Weight", "Tier", "Allocated TPS"))
+```
+
+## 4 Polling Sample — Cluster-Based TPS per Province
+
+With the per-province allocation defined, the agency draws the assigned number of TPS at
+random from each province's pool.
+
+```{r}
+#| label: stratified-sample
+
+set.seed(42)
+stratified_sample <- tps |>
+  group_by(provinsi) |>
+  group_modify(function(.x, .y) {
+    n <- province_allocation$n_allocated[province_allocation$provinsi == .y$provinsi]
+    slice_sample(.x, n = min(n, nrow(.x)))
+  }) |>
+  ungroup()
+
+cat("Total TPS sampled:", nrow(stratified_sample), "\n")
+cat("Total TPS in dataset:", nrow(tps), "\n")
+cat("Coverage:", percent(nrow(stratified_sample) / nrow(tps), accuracy = 0.01), "of all TPS\n")
+```
+
+## 5 Why Weighting Is Necessary
+
+Within each tier, every province contributes the same number of TPS to the raw sample —
+so a province with twice the voters of its tier-mate contributes equally before weighting
+but should contribute twice as much to the national estimate. DPT weighting replaces each
+province's raw sample share with its true voter share.
+
+The slope chart shows how contributions shift. Large provinces in upper tiers (lines going
+steeply **up**) are heavily under-represented in the raw sample; smaller provinces in those
+same tiers (lines going **down**) are over-represented. The effect is far more visible here
+than it would be under a proportional allocation.
+
+```{r}
+#| label: fig-stratification-check
+#| fig-cap: "Each province's raw sample share (left, equal within tier) vs its true DPT weight (right) — cluster-based allocation creates the large gap DPT weighting corrects"
+#| fig-height: 7
+
+sample_props <- stratified_sample |>
+  count(provinsi, name = "n_sampled") |>
+  mutate(sample_prop = n_sampled / sum(n_sampled))
+
+highlight <- province_dpt |>
+  arrange(desc(proportion)) |>
+  slice(c(1:4, (n() - 3):n())) |>
+  pull(provinsi)
+
+province_dpt |>
+  left_join(sample_props, by = "provinsi") |>
+  pivot_longer(c(sample_prop, proportion),
+               names_to = "stage", values_to = "contribution") |>
+  mutate(stage = factor(stage,
+    levels = c("sample_prop", "proportion"),
+    labels = c("Before\n(sample proportion)", "After\n(DPT-weighted)")
+  ),
+  is_highlight = provinsi %in% highlight) |>
+  ggplot(aes(x = stage, y = contribution, group = provinsi)) +
+  geom_line(aes(color = is_highlight, alpha = is_highlight, linewidth = is_highlight)) +
+  geom_point(aes(color = is_highlight), size = 2) +
+  geom_text(
+    data = ~ filter(.x, stage == "After\n(DPT-weighted)", is_highlight),
+    aes(label = provinsi),
+    hjust = -0.08, size = 3, color = "#2c7bb6"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_manual(values = c("gray75", "#2c7bb6"), guide = "none") +
+  scale_alpha_manual(values = c(0.4, 1), guide = "none") +
+  scale_linewidth_manual(values = c(0.5, 1.2), guide = "none") +
+  labs(
+    title = "Province Contribution: Before vs After DPT Weighting",
+    subtitle = "Highlighted: 4 largest and 4 smallest provinces by registered voters",
+    x = NULL, y = "Contribution to national estimate"
+  ) +
+  theme_minimal(base_size = 13) +
+  coord_cartesian(clip = "off") +
+  theme(plot.margin = margin(r = 140))
+```
+
+## 6 Bayesian Beta-Binomial Model
+
+Prior: Beta(1,1) — flat, no prior knowledge.
+Posterior: Beta(1 + k, 1 + n − k).
+Run independently for each of the three candidates.
+
+```{r}
+#| label: bayesian-model
+
+province_votes_long <- stratified_sample |>
+  group_by(provinsi) |>
+  summarise(
+    k_01 = sum(suara_01),
+    k_02 = sum(suara_02),
+    k_03 = sum(suara_03),
+    n    = sum(total_suara),
+    .groups = "drop"
+  ) |>
+  pivot_longer(c(k_01, k_02, k_03), names_to = "candidate", values_to = "k") |>
+  mutate(candidate = recode(candidate,
+    k_01 = "Anies (01)",
+    k_02 = "Prabowo (02)",
+    k_03 = "Ganjar (03)"
+  ))
+
+province_bayes <- province_votes_long |>
+  mutate(
+    alpha_post = 1 + k,
+    beta_post  = 1 + (n - k),
+    mean_post  = alpha_post / (alpha_post + beta_post),
+    ci_lower   = qbeta(0.025, alpha_post, beta_post),
+    ci_upper   = qbeta(0.975, alpha_post, beta_post)
+  )
+
+sample_provs <- c("DKI JAKARTA", "SUMATERA UTARA")
+
+province_bayes |>
+  filter(provinsi %in% sample_provs) |>
+  arrange(provinsi, candidate) |>
+  select(provinsi, candidate, k, n, mean_post, ci_lower, ci_upper) |>
+  mutate(across(c(mean_post, ci_lower, ci_upper), ~ percent(.x, accuracy = 0.1))) |>
+  knitr::kable(col.names = c("Provinsi", "Candidate", "Votes", "Total Votes",
+                              "Estimate", "CI Lower", "CI Upper"))
+```
+
+## 7 Province Estimates — Posterior Distributions
+
+Two provinces chosen to contrast outcomes: **SUMATERA UTARA** (estimate close to truth) and
+**DKI JAKARTA** (estimate noticeably off). Even with proportionally allocated TPS the sample
+can be unlucky — polling stations drawn from a large, diverse city like Jakarta are more likely
+to hit a non-representative pocket than in a more homogeneous province. Whether this matters
+nationally depends on each province's share of registered voters (DPT), shown in the row labels.
+
+```{r}
+#| label: fig-province-estimates
+#| fig-cap: "Blue = Beta posterior from proportionally allocated TPS · Red line = true province result · Top-left annotation = point estimate, truth, error"
+#| fig-height: 6
+#| fig-width: 11
+
+province_actual <- tps |>
+  group_by(provinsi) |>
+  summarise(
+    actual_01 = sum(suara_01) / sum(total_suara),
+    actual_02 = sum(suara_02) / sum(total_suara),
+    actual_03 = sum(suara_03) / sum(total_suara),
+    .groups = "drop"
+  ) |>
+  pivot_longer(c(actual_01, actual_02, actual_03),
+               names_to = "candidate", values_to = "actual") |>
+  mutate(candidate = recode(candidate,
+    actual_01 = "Anies (01)",
+    actual_02 = "Prabowo (02)",
+    actual_03 = "Ganjar (03)"
+  ))
+
+panel_ann <- province_bayes |>
+  filter(provinsi %in% sample_provs) |>
+  left_join(province_actual, by = c("provinsi", "candidate")) |>
+  left_join(province_dpt |> select(provinsi, proportion), by = "provinsi") |>
+  mutate(
+    error_pp = (mean_post - actual) * 100,
+    ann = paste0(
+      "Est: ",   percent(mean_post, accuracy = 0.1), "\n",
+      "True: ",  percent(actual,    accuracy = 0.1), "\n",
+      "Error: ", sprintf("%+.1f pp", error_pp)
+    )
+  )
+
+prov_labels <- province_dpt |>
+  filter(provinsi %in% sample_provs) |>
+  mutate(label = paste0(provinsi, "  (DPT: ", percent(proportion, accuracy = 0.1), ")")) |>
+  select(provinsi, label) |>
+  deframe()
+
+dist_data <- panel_ann |>
+  rowwise() |>
+  mutate(
+    x_lo  = max(0, min(ci_lower, actual) - 0.05),
+    x_hi  = min(1, max(ci_upper, actual) + 0.05),
+    curve = list(tibble(
+      x = seq(x_lo, x_hi, length.out = 600),
+      y = dbeta(seq(x_lo, x_hi, length.out = 600), alpha_post, beta_post)
+    ))
+  ) |>
+  select(-x_lo, -x_hi) |>
+  unnest(curve)
+
+ggplot(dist_data, aes(x = x, y = y)) +
+  geom_area(fill = "#2c7bb6", alpha = 0.3) +
+  geom_line(color = "#2c7bb6", linewidth = 0.9) +
+  geom_vline(aes(xintercept = actual), color = "#d73027", linewidth = 1.2) +
+  geom_text(
+    data = panel_ann,
+    aes(x = -Inf, y = Inf, label = ann),
+    hjust = -0.08, vjust = 1.25, size = 3.2, color = "gray30",
+    inherit.aes = FALSE
+  ) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  facet_grid(provinsi ~ candidate, scales = "free",
+             labeller = labeller(provinsi = prov_labels)) +
+  labs(
+    title = "Posterior Distributions vs True Province Result",
+    x = "Vote share", y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.y        = element_blank(),
+    axis.ticks.y       = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    strip.text.y       = element_text(angle = 0, hjust = 0, face = "bold", size = 11),
+    strip.text.x       = element_text(face = "bold", size = 12)
+  )
+```
+
+## 8 What Happens When We Increase n for DKI Jakarta?
+
+Section 7 showed that DKI Jakarta's estimate was noticeably off. This section asks: what if the
+polling agency had sent more surveyors to Jakarta? We start from Jakarta's cluster allocation of
+60 TPS and scale up to 600 and 6000. Each larger set is a strict superset of the previous —
+the same 60 TPS, plus 540 more, plus 5940 more — so the distributions show genuine learning
+rather than different random luck.
+
+```{r}
+#| label: jakarta-sample-size
+
+jakarta_n60_tps <- stratified_sample |> filter(provinsi == "DKI JAKARTA")
+
+set.seed(99)
+jakarta_extra <- tps |>
+  filter(provinsi == "DKI JAKARTA") |>
+  anti_join(jakarta_n60_tps |> select(tps), by = "tps") |>
+  slice_sample(n = 5940)
+
+compute_posterior <- function(tps_data, n_label) {
+  tps_data |>
+    summarise(
+      k_01 = sum(suara_01), k_02 = sum(suara_02), k_03 = sum(suara_03),
+      n    = sum(total_suara)
+    ) |>
+    pivot_longer(c(k_01, k_02, k_03), names_to = "candidate", values_to = "k") |>
+    mutate(
+      candidate  = recode(candidate,
+        k_01 = "Anies (01)", k_02 = "Prabowo (02)", k_03 = "Ganjar (03)"),
+      n_label    = n_label,
+      alpha_post = 1 + k,
+      beta_post  = 1 + (n - k),
+      mean_post  = alpha_post / (alpha_post + beta_post),
+      ci_lower   = qbeta(0.025, alpha_post, beta_post),
+      ci_upper   = qbeta(0.975, alpha_post, beta_post)
+    )
+}
+
+jakarta_compare <- bind_rows(
+  compute_posterior(jakarta_n60_tps,                                               "n = 60 TPS"),
+  compute_posterior(bind_rows(jakarta_n60_tps, slice_head(jakarta_extra, n=540)),  "n = 600 TPS"),
+  compute_posterior(bind_rows(jakarta_n60_tps, jakarta_extra),                     "n = 6000 TPS")
+) |>
+  mutate(n_label = factor(n_label, levels = c("n = 60 TPS", "n = 600 TPS", "n = 6000 TPS")))
+
+jakarta_actual <- province_actual |> filter(provinsi == "DKI JAKARTA")
+```
+
+```{r}
+#| label: fig-jakarta-sample-size
+#| fig-cap: "Each distribution is built on the same TPS as the one before it, plus more. Red line = true DKI Jakarta result."
+#| fig-height: 5
+
+n_colors <- c("n = 60 TPS"   = "#a8c8e8",
+               "n = 600 TPS"  = "#3d8ecf",
+               "n = 6000 TPS" = "#1a3d6e")
+
+x_bounds <- jakarta_compare |>
+  left_join(jakarta_actual, by = "candidate") |>
+  group_by(candidate) |>
+  summarise(
+    x_lo = max(0, min(ci_lower, actual) - 0.04),
+    x_hi = min(1, max(ci_upper, actual) + 0.04),
+    .groups = "drop"
+  )
+
+dist_jakarta <- jakarta_compare |>
+  left_join(jakarta_actual,  by = "candidate") |>
+  left_join(x_bounds,        by = "candidate") |>
+  rowwise() |>
+  mutate(curve = list(tibble(
+    x = seq(x_lo, x_hi, length.out = 600),
+    y = dbeta(seq(x_lo, x_hi, length.out = 600), alpha_post, beta_post)
+  ))) |>
+  select(-x_lo, -x_hi) |>
+  unnest(curve)
+
+jakarta_ann <- jakarta_compare |>
+  left_join(jakarta_actual, by = "candidate") |>
+  mutate(
+    error_pp = (mean_post - actual) * 100,
+    x_ann    = (alpha_post - 1) / (alpha_post + beta_post - 2),
+    y_ann    = dbeta(x_ann, alpha_post, beta_post),
+    label    = sprintf("%+.1f pp", error_pp)
+  )
+
+ggplot(dist_jakarta, aes(x = x, y = y, color = n_label, fill = n_label)) +
+  geom_area(alpha = 0.18, position = "identity") +
+  geom_line(linewidth = 0.9) +
+  geom_vline(
+    data = jakarta_actual, aes(xintercept = actual),
+    color = "#d73027", linewidth = 1.2, inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = jakarta_ann,
+    aes(x = x_ann, y = y_ann, label = label, color = n_label),
+    vjust = -0.4, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = n_colors) +
+  scale_fill_manual(values  = n_colors) +
+  facet_wrap(~ candidate, scales = "free_x") +
+  labs(
+    title = "DKI Jakarta — Effect of Increasing TPS Sample Size",
+    subtitle = "Larger n → narrower posterior, closer to the red truth line",
+    x = "Vote share", y = NULL, color = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.y        = element_blank(),
+    axis.ticks.y       = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.position    = "top",
+    strip.text         = element_text(face = "bold")
+  )
+```
+
+```{r}
+#| label: jakarta-accuracy-table
+
+jakarta_compare |>
+  left_join(jakarta_actual, by = "candidate") |>
+  mutate(
+    error_pp = (mean_post - actual) * 100,
+    cell     = paste0(percent(mean_post, accuracy = 0.1),
+                      " (", sprintf("%+.1f pp", error_pp), ")")
+  ) |>
+  select(candidate, n_label, cell) |>
+  pivot_wider(names_from = n_label, values_from = cell) |>
+  left_join(
+    jakarta_actual |> mutate(true = percent(actual, accuracy = 0.1)) |> select(candidate, true),
+    by = "candidate"
+  ) |>
+  select(candidate, `n = 60 TPS`, `n = 600 TPS`, `n = 6000 TPS`, true) |>
+  knitr::kable(col.names = c("Candidate",
+                              "Estimate & Error (n = 60)",
+                              "Estimate & Error (n = 600)",
+                              "Estimate & Error (n = 6000)",
+                              "True"))
+```
+
+## 9 National Weighted Estimate vs True Result
+
+Before computing the final national estimate, it is worth asking: do the provincial errors we
+observed actually matter at the national level? The impact of any single province's miss is
+bounded by its share of registered voters — a large error in a small province is heavily diluted.
+
+```{r}
+#| label: national-impact
+
+panel_ann |>
+  mutate(national_impact_pp = abs(error_pp) * proportion) |>
+  select(provinsi, candidate, error_pp, proportion, national_impact_pp) |>
+  mutate(
+    error_pp           = sprintf("%+.2f pp", error_pp),
+    proportion         = percent(proportion, accuracy = 0.1),
+    national_impact_pp = sprintf("%.3f pp", national_impact_pp)
+  ) |>
+  knitr::kable(col.names = c("Province", "Candidate",
+                              "Province error", "DPT weight",
+                              "National impact (error × weight)"))
+```
+
+With that context established, we now aggregate all province posteriors into a national estimate.
+Province-level posteriors are weighted by each province's DPT share, correcting for the unequal
+proportional allocation in Section 4. A naive (unweighted) aggregate treats every province as equal
+and is shown alongside as a baseline.
+
+```{r}
+#| label: national-estimate
+
+actuals <- tibble(
+  candidate = c("Anies (01)", "Prabowo (02)", "Ganjar (03)"),
+  actual    = c(0.2495, 0.5859, 0.1647)
+)
+
+national_est <- province_bayes |>
+  left_join(province_dpt |> select(provinsi, proportion), by = "provinsi") |>
+  group_by(candidate) |>
+  summarise(
+    naive_mean     = mean(mean_post),
+    weighted_mean  = sum(mean_post  * proportion),
+    weighted_lower = sum(ci_lower   * proportion),
+    weighted_upper = sum(ci_upper   * proportion),
+    .groups = "drop"
+  ) |>
+  left_join(actuals, by = "candidate") |>
+  mutate(
+    naive_error    = naive_mean    - actual,
+    weighted_error = weighted_mean - actual
+  )
+
+national_est |>
+  mutate(across(c(naive_mean, weighted_mean, weighted_lower, weighted_upper, actual),
+                ~ percent(.x, accuracy = 0.01)),
+         across(c(naive_error, weighted_error), ~ percent(.x, accuracy = 0.01))) |>
+  knitr::kable(col.names = c("Candidate", "Naive", "Weighted", "CI Lower", "CI Upper",
+                              "True", "Naive Error", "Weighted Error"))
+```
+
+```{r}
+#| label: fig-national-estimate
+#| fig-cap: "Weighted estimate (blue) closely tracks the true result (red). Naive estimate (gray) is biased by over-weighting small provinces."
+
+national_est |>
+  pivot_longer(c(naive_mean, weighted_mean, actual),
+               names_to = "type", values_to = "value") |>
+  mutate(type = recode(type,
+    naive_mean    = "Naive (unweighted)",
+    weighted_mean = "DPT-weighted estimate",
+    actual        = "True result"
+  ),
+  type = factor(type, levels = c("True result", "DPT-weighted estimate", "Naive (unweighted)"))) |>
+  ggplot(aes(x = candidate, y = value, color = type, shape = type)) +
+  geom_errorbar(
+    data = national_est,
+    aes(x = candidate, ymin = weighted_lower, ymax = weighted_upper),
+    inherit.aes = FALSE,
+    width = 0.15, color = "#2c7bb6", linewidth = 0.8
+  ) +
+  geom_point(size = 4, position = position_dodge(width = 0.4)) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_manual(values = c("True result" = "#d73027",
+                                "DPT-weighted estimate" = "#2c7bb6",
+                                "Naive (unweighted)" = "gray50")) +
+  scale_shape_manual(values = c("True result" = 18,
+                                "DPT-weighted estimate" = 16,
+                                "Naive (unweighted)" = 15)) +
+  labs(
+    title = "National Estimate: Weighted vs Naive vs True",
+    subtitle = paste0("Polling agency sampled ", nrow(stratified_sample),
+                      " TPS proportionally allocated by province (",
+                      percent(nrow(stratified_sample) / nrow(tps), accuracy = 0.01),
+                      " of all TPS)"),
+    x = NULL, y = "Estimated national support", color = NULL, shape = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
