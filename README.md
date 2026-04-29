@@ -1,5 +1,7 @@
 # Pilpres 2024 — Bayesian Polling from TPS Data
 
+*notes: readme written by AI and checked by owner*
+
 A statistical analysis that simulates how a polling agency could estimate the 2024 Indonesian Presidential Election result using a small sample of polling stations (TPS), Bayesian inference, and DPT-weighted aggregation.
 
 ## Overview
@@ -119,7 +121,3 @@ A naive (unweighted) average is also shown as a biased baseline.
 Raw data: [khrlimam/pemilu2024-suara-tps](https://github.com/khrlimam/pemilu2024-suara-tps)
 
 Official results: [KPU — Komisi Pemilihan Umum](https://pemilu2024.kpu.go.id/)
-
-## Author
-
-Derrian Gharda
