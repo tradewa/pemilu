@@ -18,3 +18,4 @@ data/
 # Agent/tool files
 AGENT.md
 docker-skill.md
+.positai

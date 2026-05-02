@@ -29,13 +29,13 @@ The analysis shows that even with a tiny sample, DPT-weighted Bayesian aggregati
 ```
 .
 ├── analysis.qmd          # Main Quarto notebook — all analysis lives here
-├── analysis.html         # Rendered output (self-contained)
+├── analysis.html         # Rendered output (generated locally, not in git)
 ├── data/
 │   └── tps_raw.csv       # KPU TPS data (823k rows, ~328 MB — not in git)
 ├── setup/
 │   ├── setup_renv.R      # Run once to initialise the renv environment
 │   └── packages.R        # Package installation + renv::snapshot()
-├── renv/                 # renv environment (reproducible package versions)
+├── renv/                 # renv activation files; local package library is not in git
 └── renv.lock             # Locked package versions
 ```
 
@@ -64,9 +64,11 @@ https://github.com/khrlimam/pemilu2024-suara-tps/releases/download/2024-04-18/20
 
 **3. Restore the R environment**
 
-```r
-Rscript setup/setup_renv.R
+```bash
+Rscript -e 'if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv"); renv::restore(prompt = FALSE)'
 ```
+
+The `setup/` scripts are mostly for creating or updating the lockfile during development.
 
 **4. Render the notebook**
 
@@ -74,7 +76,8 @@ Rscript setup/setup_renv.R
 quarto render analysis.qmd
 ```
 
-This produces `analysis.html` — a self-contained, shareable report.
+This produces `analysis.html`, a local rendered report. The rendered HTML and figure/cache
+folders are ignored by git.
 
 ## Methodology
 
@@ -89,7 +92,7 @@ Provinces are sorted into 4 tiers by registered voter share (DPT). Each tier rec
 | 3 | 50–75% | 60 |
 | 4 (largest) | Top 25% | 100 |
 
-Within each tier, every province receives the same number of TPS visits regardless of population differences. This intentional over-representation of smaller provinces is corrected at aggregation via DPT weighting.
+Within each tier, every province receives the same number of TPS visits regardless of population differences. This intentionally creates a mismatch between raw sample share and true DPT share; DPT weighting corrects that mismatch at aggregation.
 
 ### Bayesian Model
 
